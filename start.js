@@ -18,10 +18,9 @@ let assocFirstMarketSourceAsks = {};
 let assocSecondMarketSourceBids = {};
 let assocSecondMarketSourceAsks = {};
 
-let pivotCurrency;
+
 
 let first_market, second_market;
-let convertToCompositePrice = (firstMarketPrice) => firstMarketPrice;
 
 let assocDestOrdersBySourcePrice = {};
 let bExiting = false;
@@ -117,12 +116,10 @@ async function cancelDestOrder(source_price) {
 async function updateDestBids(bids) {
 	let unlock = await mutex.lock('bids');
 	let dest_balances = await balances.getBalances();
-	let source_balances = await source.getBalances();
 	console.error('dest balances', dest_balances);
-	let dest_quote_balance_available = (dest_balances[conf.quote_currency] || 0)/1e8 - conf.MIN_QUOTE_BALANCE;
-	let source_base_balance_available = (source_balances.free.GBYTE || 0) - conf.MIN_BASE_BALANCE;
+	let dest_quote_balance_available = (dest_balances[conf.quote_currency] || 0)/ (10**conf.quote_decimals) - conf.MIN_QUOTE_BALANCE;
 	let arrNewOrders = [];
-	let bDepleted = (dest_quote_balance_available <= 0 || source_base_balance_available <= 0);
+	let bDepleted = dest_quote_balance_available <= 0;
 	for (let i = 0; i < bids.length; i++){
 		let bid = bids[i];
 		let source_price = bid.price;
@@ -131,16 +128,11 @@ async function updateDestBids(bids) {
 			continue;
 		}
 		let size = parseFloat(bid.size);
-		if (size > source_base_balance_available) {
-			bDepleted = true;
-			console.log("bid #" + i + ": " + size + " GB at " + source_price + " but have only " + source_base_balance_available + " GB available on source");
-			size = source_base_balance_available;
-		}
 		let dest_price = parseFloat(source_price) * (1 - conf.MARKUP / 100);
 		let dest_quote_amount_required = size * dest_price;
 		if (dest_quote_amount_required > dest_quote_balance_available) {
 			bDepleted = true;
-			console.log("bid #" + i + ": " + size + " GB at " + source_price + " requires " + dest_quote_amount_required + " BTC on dest but have only " + dest_quote_balance_available + " BTC available on dest");
+			console.log("bid #" + i + ": " + size + " GB at " + source_price + " requires " + dest_quote_amount_required + " "+ conf.quote_currency +" on dest but have only " + dest_quote_balance_available + " available on dest");
 			dest_quote_amount_required = dest_quote_balance_available;
 			size = dest_quote_amount_required / dest_price;
 		}
@@ -149,7 +141,6 @@ async function updateDestBids(bids) {
 		if (bNeedNewOrder && size >= conf.MIN_DEST_ORDER_SIZE)
 			arrNewOrders.push({ size, source_price, side: 'BUY' });
 		if (size >= conf.MIN_DEST_ORDER_SIZE) {
-			source_base_balance_available -= size;
 			dest_quote_balance_available -= dest_quote_amount_required;
 		}
 		else
@@ -159,15 +150,14 @@ async function updateDestBids(bids) {
 	return arrNewOrders;
 }
 
+
 async function updateDestAsks(asks) {
 	let unlock = await mutex.lock('asks');
 	let dest_balances = await balances.getBalances();
-	let source_balances = await source.getBalances();
 	console.error('dest balances', dest_balances);
 	let dest_base_balance_available = (dest_balances.GBYTE || 0)/1e9 - conf.MIN_BASE_BALANCE;
-	let source_quote_balance_available = (source_balances.free.BTC || 0) - conf.MIN_QUOTE_BALANCE;
 	let arrNewOrders = [];
-	let bDepleted = (dest_base_balance_available <=0 || source_quote_balance_available <= 0);
+	let bDepleted = dest_base_balance_available <=0;
 	for (let i = 0; i < asks.length; i++){
 		let ask = asks[i];
 		let source_price = ask.price;
@@ -181,19 +171,11 @@ async function updateDestAsks(asks) {
 			console.log("ask #" + i + ": " + size + " GB at " + source_price + " but have only " + dest_base_balance_available + " GB available on dest");
 			size = dest_base_balance_available;
 		}
-		let source_quote_amount_required = size * parseFloat(source_price);
-		if (source_quote_amount_required > source_quote_balance_available) {
-			bDepleted = true;
-			console.log("ask #" + i + ": " + size + " GB at " + source_price + " requires " + source_quote_amount_required + " BTC on source but have only " + source_quote_balance_available + " BTC available on source");
-			source_quote_amount_required = source_quote_balance_available;
-			size = source_quote_amount_required / parseFloat(source_price);
-		}
 		// cancel the old order first, otherwise if it was downsized and made up more room for other orders, we might hit insufficient balance error when we try to place them
 		let bNeedNewOrder = await cancelPreviousDestOrderIfChanged('SELL', size, source_price);
 		if (bNeedNewOrder && size >= conf.MIN_DEST_ORDER_SIZE)
 			arrNewOrders.push({ size, source_price, side: 'SELL' });
 		if (size >= conf.MIN_DEST_ORDER_SIZE) {
-			source_quote_balance_available -= source_quote_amount_required;
 			dest_base_balance_available -= size;
 		}
 		else
@@ -221,30 +203,6 @@ async function scanAndUpdateDestAsks() {
 	return await updateDestAsks(asks);
 }
 
-async function onSourceOrderbookSnapshotOld(snapshot) {
-	let unlock = await mutex.lock('update');
-	console.error('received snapshot');
-	assocCompositeSourceBids = {};
-	assocCompositeSourceAsks = {};
-	snapshot.bids.forEach(bid => {
-		assocCompositeSourceBids[bid.price] = bid.size;
-	});
-	snapshot.asks.forEach(ask => {
-		assocCompositeSourceAsks[ask.price] = ask.size;
-	});
-	// in case a secondary (non-initial) snapshot is received, we need to check if we missed some updates
-	for (let source_price in assocDestOrdersBySourcePrice) {
-		if (!assocCompositeSourceBids[source_price] && !assocCompositeSourceAsks[source_price]) {
-			console.log("order at " + source_price + " not found in new snapshot from source, will cancel on dest");
-			await cancelDestOrder(source_price);
-		}
-	}
-	let arrNewBuyOrders = await updateDestBids(snapshot.bids);
-	let arrNewSellOrders = await updateDestAsks(snapshot.asks);
-	await createDestOrders(arrNewBuyOrders.concat(arrNewSellOrders));
-	unlock();
-}
-
 
 async function onSourceOrderbookSnapshot(snapshot) {
 	let unlock = await mutex.lock('update');
@@ -266,15 +224,24 @@ async function onSourceOrderbookSnapshot(snapshot) {
 	} else
 		throw Error("unsolicited snapshot received " + snapshot.id)
 
-
 	await updateCompositeMarket()
+
+	for (let source_price in assocDestOrdersBySourcePrice) {
+		if (!assocCompositeSourceBids[source_price] && !assocCompositeSourceAsks[source_price]) {
+			console.log("order at " + source_price + " not found in new snapshot from source, will cancel on dest");
+			await cancelDestOrder(source_price);
+		}
+	}
+	let arrNewBuyOrders = await scanAndUpdateDestBids(assocCompositeSourceBids);
+	let arrNewSellOrders = await scanAndUpdateDestAsks(assocCompositeSourceAsks);
+	await createDestOrders(arrNewBuyOrders.concat(arrNewSellOrders));
+
 	unlock();
 }
 
 
 
 async function onSourceOrderbookUpdate(update) {
-	//	return;
 	let unlock = await mutex.lock('update');
 	console.error('update', JSON.stringify(update, null, '\t'));
 
@@ -295,106 +262,65 @@ async function onSourceOrderbookUpdate(update) {
 		updateSide('asks', assocSecondMarketSourceAsks);
 	} else
 		throw Error("unsolicited update received " + snapshot.id)
-
-console.log(assocFirstMarketSourceBids);
-console.log(assocFirstMarketSourceAsks);
-console.log(assocSecondMarketSourceBids);
-console.log(assocSecondMarketSourceAsks);
-
 	await updateCompositeMarket()
+
+
+	let arrNewBuyOrders = [];
+	let arrNewSellOrders = [];
+
+	for (let source_price in assocDestOrdersBySourcePrice) {
+		if (!assocCompositeSourceBids[source_price] && !assocCompositeSourceAsks[source_price]) {
+			console.log("order at " + source_price + " not found in new snapshot from source, will cancel on dest");
+			await cancelDestOrder(source_price);
+		}
+	}
+
+	arrNewBuyOrders = await scanAndUpdateDestBids();
+	arrNewSellOrders = await scanAndUpdateDestAsks();
+	// we cancel all removed/updated orders first, then create new ones to avoid overlapping prices and self-trades
+	await createDestOrders(arrNewBuyOrders.concat(arrNewSellOrders));
+
+
 	unlock();
 }
 
 async function updateCompositeMarket(){
 
-	var newCompositeSourceBids,newCompositeSourceAsks;
-
 	let source_balances = await source.getBalances();
 
-	const resultingBaseBalanceOnSource = 500;//source_balances.free[conf.resulting_base] || 0;
+	const resultingBaseBalanceOnSource = source_balances.free[first_market.base] || 0;
+	const resultingQuoteBalanceOnSource = source_balances.free[second_market ? second_market.quote : first_market.base] || 0;
 
-	if (conf.resulting_base == first_market.base) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('bids', assocFirstMarketSourceBids, resultingBaseBalanceOnSource);
-		process.stdout.write('\ntruncatedOrders \n' + JSON.stringify(truncatedOrders))
-		if (first_market.quote == second_market.quote)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'asks', assocSecondMarketSourceAsks); // -> second case
-		else if (first_market.quote == second_market.base)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'bids', assocSecondMarketSourceBids); //-> first case
+		if (second_market) {
+			const truncatedBids = truncateBids(true, assocFirstMarketSourceBids, resultingBaseBalanceOnSource);
+			assocCompositeSourceBids = combineBooks(truncatedBids, 'bids', assocSecondMarketSourceBids); //-> first case
+		}
+		else {
+			const truncatedBids = truncateBids(false, assocFirstMarketSourceBids, resultingBaseBalanceOnSource);
+			assocCompositeSourceBids = arr2Assoc(truncatedBids);
+		//	assocCompositeSourceBids = truncatedBids;
+
+		}
+		
+		const truncatedAsks = truncateAsks(second_market ? assocSecondMarketSourceAsks : assocFirstMarketSourceAsks, resultingQuoteBalanceOnSource);
+		if (second_market)
+			assocCompositeSourceAsks = combineBooks(truncatedAsks, 'asks', assocFirstMarketSourceAsks);// -> first case
 		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_base == first_market.quote) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('asks', assocFirstMarketSourceAsks, resultingBaseBalanceOnSource);
-		if (first_market.base == second_market.quote)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'asks', assocSecondMarketSourceAsks);
-		else if (first_market.base == second_market.base)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'bids', assocSecondMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_base == second_market.base) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('bids', assocSecondMarketSourceBids, resultingBaseBalanceOnSource);
-		if (second_market.quote == first_market.quote)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'asks', assocFirstMarketSourceAsks);
-		else if (second_market.quote == first_market.base)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'bids', assocFirstMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_base == second_market.quote) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('asks', assocSecondMarketSourceAsks, resultingBaseBalanceOnSource);
-		if (second_market.base == first_market.quote)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'asks', assocFirstMarketSourceAsks);
-		else if (second_market.base == first_market.base)
-			newCompositeSourceBids = combineBooks(truncatedOrders, 'bids', assocFirstMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	}
-	
-	const resultingQuoteBalanceOnSource = 5000//source_balances.free[conf.resulting_quote] || 0;
-	if (conf.resulting_quote == first_market.base) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('bids', assocFirstMarketSourceBids, resultingQuoteBalanceOnSource);
-		if (first_market.quote == second_market.quote)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'asks', assocSecondMarketSourceAsks);
-		else if (first_market.quote == second_market.base)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'bids', assocSecondMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_quote == first_market.quote) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('asks', assocFirstMarketSourceAsks, resultingQuoteBalanceOnSource);
-		if (first_market.base == second_market.quote)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'asks', assocSecondMarketSourceAsks);
-		else if (first_market.base == second_market.base)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'bids', assocSecondMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_quote == second_market.base) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('bids', assocSecondMarketSourceBids, resultingQuoteBalanceOnSource);
-		if (second_market.quote == first_market.quote)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'asks', assocFirstMarketSourceAsks); // -> second case
-		else if (second_market.quote == first_market.base)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'bids', assocFirstMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	} else if (conf.resulting_quote == second_market.quote) {
-		const truncatedOrders = truncateSideAndPutPivotAsBase('asks', assocSecondMarketSourceAsks, resultingQuoteBalanceOnSource);
-		if (second_market.base == first_market.quote)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'asks', assocFirstMarketSourceAsks);// -> first case
-		else if (second_market.base == first_market.base)
-			newCompositeSourceAsks = combineBooks(truncatedOrders, 'bids', assocFirstMarketSourceBids);
-		else
-			throw Error('no second market found for pivot')
-	}
+			assocCompositeSourceAsks = arr2Assoc(truncatedAsks);
+		//	assocCompositeSourceAsks = truncatedAsks;
 
 
-	process.stdout.write('\newCompositeSourceBids\n' + JSON.stringify(newCompositeSourceBids));
-	var total = 0;
-	for (var key in newCompositeSourceBids)
-		total += parseFloat(newCompositeSourceBids[key]);
-	process.stdout.write('\n total: ' + total);
+	process.stdout.write('\assocCompositeSourceBids\n' + JSON.stringify(assocCompositeSourceBids));
+	//var total = assocCompositeSourceBids.reduce((previous, current)=>{return previous + parseFloat(current.size)}, 0);
 
-	process.stdout.write('\newCompositeSourceAsks\n' + JSON.stringify(newCompositeSourceAsks));
-	var total = 0;
-	for (var key in newCompositeSourceAsks)
-		total += parseFloat(newCompositeSourceAsks[key]);
-	process.stdout.write('\n total: ' + total);
+//	for (var key in assocCompositeSourceBids)
+	//process.stdout.write('\n total: ' + total);
+
+	process.stdout.write('\assocCompositeSourceAsks\n' + JSON.stringify(assocCompositeSourceAsks));
+//	var total = assocCompositeSourceAsks.reduce((previous, current)=>{return previous + parseFloat(current.size)}, 0);
+//	for (var key in assocCompositeSourceAsks)
+//		total += parseFloat(assocCompositeSourceAsks[key]);
+//	process.stdout.write('\n total: ' + total);
 
 	function assocOrders2ArrOrders(type, assocOrders){
 		const orders = [];
@@ -409,42 +335,52 @@ async function updateCompositeMarket(){
 		return orders;
 	}
 
-	function truncateSideAndPutPivotAsBase(type, assocOrders, balance){
-		const fullOrders = assocOrders2ArrOrders(type, assocOrders);
+	function arr2Assoc(arr){
+		const assoc = {};
+		arr.forEach((obj)=>{
+			assoc[obj.price] = obj.size;
+		})
+		return assoc;
+	}
+
+	function truncateBids(bInverse, assocOrders, balance){
+		const fullOrders = assocOrders2ArrOrders('bids', assocOrders);
 		const truncatedOrders = [];
-		if (type == 'bids') {
 			for (var i = 0; i < fullOrders.length; i++){
 				if (balance > fullOrders[i].size) {
 					balance -= fullOrders[i].size;
-					fullOrders[i].size = fullOrders[i].size * fullOrders[i].price;
-					fullOrders[i].price = 1 / fullOrders[i].price;
+					fullOrders[i].size = bInverse ? fullOrders[i].size * fullOrders[i].price : fullOrders[i].size;
+					fullOrders[i].price = bInverse ? 1 / fullOrders[i].price : fullOrders[i].price;
 					truncatedOrders.push(fullOrders[i]);
 				} else {
 					if (balance > 0){
-						fullOrders[i].size = balance * fullOrders[i].price;
-						fullOrders[i].price = 1 / fullOrders[i].price;
+							fullOrders[i].size = bInverse ? balance * fullOrders[i].price : balance;
+							fullOrders[i].price = bInverse ? 1 / fullOrders[i].price : fullOrders[i].price;
 						truncatedOrders.push(fullOrders[i]);
 					}
 					break;
 				}
 			}
-		} else if (type == 'asks'){
-			for (var i = 0; i < fullOrders.length; i++){
-				if (balance > fullOrders[i].size * fullOrders[i].price) {
-					balance -= fullOrders[i].size * fullOrders[i].price;
-					truncatedOrders.push(fullOrders[i]);
-				} else {
-					if (balance > 0){
-						fullOrders[i].size = balance / fullOrders[i].price;
-						truncatedOrders.push(fullOrders[i]);
-					}
-					break;
-				}
-			}
-		} else
-			throw Error('unknown type');
 		return truncatedOrders;
+	}
 
+
+	function truncateAsks(assocOrders, balance){
+		const fullOrders = assocOrders2ArrOrders('asks', assocOrders);
+		const truncatedOrders = [];
+		for (var i = 0; i < fullOrders.length; i++){
+			if (balance > fullOrders[i].size * fullOrders[i].price) {
+				balance -= fullOrders[i].size * fullOrders[i].price;
+				truncatedOrders.push(fullOrders[i]);
+			} else {
+				if (balance > 0){
+					fullOrders[i].size = balance / fullOrders[i].price;
+					truncatedOrders.push(fullOrders[i]);
+				}
+				break;
+			}
+		}
+		return truncatedOrders;
 	}
 
 	// pivot as base
@@ -459,73 +395,40 @@ async function updateCompositeMarket(){
 			while (truncatedOrders[i] && truncatedOrders[i].size > 0 && orders[j] && orders[j].size > 0){
 				const price = orders[j].price / truncatedOrders[i].price;
 				if (truncatedOrders[i].size >= orders[j].size){
-					assocCombinedOrdersByPrice[price] = orders[j].size * truncatedOrders[i].price;
+					assocCombinedOrdersByPrice[price] = orders[j].size * truncatedOrders[i].price ;
+			//		combinedOrders.push({price, size: orders[j].size * truncatedOrders[i].price})
 					truncatedOrders[i].size -=  orders[j].size;
 					j++;
 				} else {
-					assocCombinedOrdersByPrice[price] = truncatedOrders[i].size  * truncatedOrders[i].price;
+				assocCombinedOrdersByPrice[price] = truncatedOrders[i].size * truncatedOrders[i].price;
+				//	combinedOrders.push({price, size: truncatedOrders[i].size * truncatedOrders[i].price})
 					orders[j].size -= truncatedOrders[i].size;
 					i++;
 				}
 			}
-		} else if (type == 'asks'){
-				while (truncatedOrders[i] && truncatedOrders[i].size > 0 && orders[j] && orders[j].size > 0){
-					const price = orders[j].price * truncatedOrders[i].price;
-					if (truncatedOrders[i].size >= orders[j].price * orders[j].size){
-						assocCombinedOrdersByPrice[price] = orders[j].size;
-						truncatedOrders[i].size -= orders[j].price * orders[j].size;
-						j++;
-					} else {
-						assocCombinedOrdersByPrice[price] = truncatedOrders[i].size / orders[j].price;
-						orders[j].size -= truncatedOrders[i].size * orders[j].price ;
-						i++;
-					}
+		} else {
+			while (truncatedOrders[i] && truncatedOrders[i].size > 0 && orders[j] && orders[j].size > 0){
+				const price = orders[j].price * truncatedOrders[i].price;
+				if (truncatedOrders[i].size >= orders[j].price * orders[j].size){
+					assocCombinedOrdersByPrice[price] = orders[j].size;
+				//	combinedOrders.push({price, size: orders[j].size})
+
+					truncatedOrders[i].size -= orders[j].price * orders[j].size;
+					j++;
+				} else {
+					assocCombinedOrdersByPrice[price] = truncatedOrders[i].size / orders[j].price;
+			//		combinedOrders.push({price, size: truncatedOrders[i].size / orders[j].price})
+
+					orders[j].size -= truncatedOrders[i].size * orders[j].price ;
+					i++;
 				}
+			}
 		}
 		return assocCombinedOrdersByPrice;
 	}
 
 
 
-}
-
-
-async function onSourceOrderbookUpdateold(update) {
-	let unlock = await mutex.lock('update');
-	console.error('update', JSON.stringify(update, null, '\t'));
-	let arrNewBuyOrders = [];
-	let arrNewSellOrders = [];
-	if (update.bids.length > 0) {
-		for (let i = 0; i < update.bids.length; i++) {
-			let bid = update.bids[i];
-			let size = parseFloat(bid.size);
-			if (size === 0) {
-				console.log("bid at " + bid.price + " removed from source, will cancel on dest");
-				delete assocCompositeSourceBids[bid.price];
-				await cancelDestOrder(bid.price);
-			}
-			else
-				assocCompositeSourceBids[bid.price] = bid.size;
-		}
-		arrNewBuyOrders = await scanAndUpdateDestBids();
-	}
-	if (update.asks.length > 0) {
-		for (let i = 0; i < update.asks.length; i++) {
-			let ask = update.asks[i];
-			let size = parseFloat(ask.size);
-			if (size === 0) {
-				console.log("ask at " + ask.price + " removed from source, will cancel on dest");
-				delete assocCompositeSourceAsks[ask.price];
-				await cancelDestOrder(ask.price);
-			}
-			else
-				assocCompositeSourceAsks[ask.price] = ask.size;
-		}
-		arrNewSellOrders = await scanAndUpdateDestAsks();
-	}
-	// we cancel all removed/updated orders first, then create new ones to avoid overlapping prices and self-trades
-	await createDestOrders(arrNewBuyOrders.concat(arrNewSellOrders));
-	unlock();
 }
 
 async function onDestDisconnect() {
@@ -642,57 +545,6 @@ function startBittrexWs() {
 			base: conf.second_bittrex_pair.split('-')[1], // standardized base symbol for Bitcoin
 			quote: conf.second_bittrex_pair.split('-')[0], // standardized quote symbol for Tether
 		};
-
-		process.stdout.write(JSON.stringify(first_market));
-		process.stdout.write(JSON.stringify(second_market));
-		process.stdout.write(JSON.stringify(conf.resulting_quote));
-		process.stdout.write(JSON.stringify(conf.resulting_base));
-
-
-	if (first_market.quote == second_market.quote || first_market.quote == second_market.base)
-		pivotCurrency = first_market.quote;
-	else if (first_market.base == second_market.quote || first_market.base == second_market.base)
-		pivotCurrency = first_market.base;
-	else
-		throw Error("no pivot currency")
-
-		if (conf.resulting_quote == first_market.quote && conf.resulting_base == first_market.base)
-			throw Error("resulting market is first market")
-		if (conf.resulting_quote == second_market.quote && conf.resulting_base == second_market.base)
-			throw Error("resulting market is second market")
-
-		if (conf.resulting_quote == first_market.base && conf.resulting_base == first_market.quote)
-			throw Error("second market is useless")
-		if (conf.resulting_quote == second_market.base && conf.resulting_base == second_market.quote)
-			throw Error("first market is useless")
-
-		if ((conf.resulting_quote == first_market.quote || conf.resulting_quote == second_market.quote) &&
-				conf.resulting_base == first_market.base || conf.resulting_base == second_market.base) {
-
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => firstMarketPrice * secondMarketPrice;
-
-		} else if (conf.resulting_quote == second_market.quote && conf.resulting_base == first_market.quote) {
-
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => secondMarketPrice / firstMarketPrice;
-
-		} else if (conf.resulting_quote == first_market.quote && conf.resulting_base == second_market.quote) {
-
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => firstMarketPrice / secondMarketPrice;
-
-		} else if (conf.resulting_quote == second_market.base && conf.resulting_base == first_market.base) {
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => firstMarketPrice / secondMarketPrice;
-
-		} else if (conf.resulting_quote == first_market.base && conf.resulting_base == second_market.base) {
-
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => secondMarketPrice / firstMarketPrice;
-
-		} else if ((conf.resulting_quote == first_market.base || conf.resulting_quote == second_market.base) &&
-		(conf.resulting_base == first_market.quote || conf.resulting_base == second_market.quote)) {
-
-			convertToCompositePrice = (firstMarketPrice, secondMarketPrice) => 1 / (firstMarketPrice / secondMarketPrice);
-
-		} else 
-			throw Error("impossible to convert to resulting pair")
 
 		bittrexWS.subscribeTrades(second_market);
 	}

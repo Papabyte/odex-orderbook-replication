@@ -50,12 +50,10 @@ exports.MARKUP = (typeof process.env.MARKUP !== 'undefined') ? parseFloat(proces
 exports.first_bittrex_pair = 'BTC-GBYTE';
 exports.second_bittrex_pair = 'USD-BTC'; // set false if not used
 
-exports.resulting_quote = 'USD';
-exports.resulting_base = 'GBYTE';
-
 
 // destination
-exports.quote_currency = 'BTC_20200701';
+exports.quote_currency = 'USDC';
+exports.quote_decimals = 6;
 exports.dest_pair = 'GBYTE/' + exports.quote_currency;
 
 exports.MIN_QUOTE_BALANCE = 0.001;

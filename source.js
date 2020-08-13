@@ -14,6 +14,7 @@ let bittrex = new ccxt.bittrex({
 
 
 async function createMarketTx(side, size) {
+	return process.stdout.write('createMarketTx ' + side + ' ' + size)
 	if (side === 'BUY')
 		size += queued_amount;
 	else
